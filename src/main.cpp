@@ -10,8 +10,8 @@
 // Redraws once a minute. Between updates the ESP32 light-sleeps: the panel
 // controller stays powered (GPIO1 rail held), so its RAM survives as the
 // differential baseline and each minute's repaint is a FAST refresh with NO
-// black/white flash. A HALF scrub (which does flash) runs at the top of each
-// hour to clear accumulated ghosting; one FULL refresh runs at startup.
+// black/white flash. One FULL refresh runs at startup; there is no periodic
+// scrub (drop in a HALF refresh here later if ghosting proves to accumulate).
 //
 // Option D per the plan: no deep sleep, no rail cut — trades higher average
 // sleep current for a flicker-free clock. The point is to measure that current.
@@ -195,12 +195,9 @@ void loop() {
   const bool battOk = readBattery(pct);
   const uint16_t mv = battery.readMillivolts();
 
-  const bool scrub = rtcOk && dt.minute == 0;  // hourly ghost-cleanup pass
   renderStatus(dt, rtcOk, pct, battOk, mv);
-  display.displayBuffer(scrub ? EInkDisplay::HALF_REFRESH : EInkDisplay::FAST_REFRESH,
-                        /*turnOffScreen=*/true);
+  display.displayBuffer(EInkDisplay::FAST_REFRESH, /*turnOffScreen=*/true);
 
-  Serial.printf("tick: %s %ldd %02u:%02u  batt=%u%% %umV  mode=%s awake=%d\n", rtcOk ? "ok" : "RTC?",
-                rtcOk ? elapsedDays(dt) : 0L, dt.hour, dt.minute, pct, mv, scrub ? "HALF" : "FAST",
-                (bool)Serial);
+  Serial.printf("tick: %s %ldd %02u:%02u  batt=%u%% %umV  awake=%d\n", rtcOk ? "ok" : "RTC?",
+                rtcOk ? elapsedDays(dt) : 0L, dt.hour, dt.minute, pct, mv, (bool)Serial);
 }

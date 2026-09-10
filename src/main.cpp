@@ -24,6 +24,8 @@
 //   * On battery it light-sleeps, but arms a wake on GPIO21 going HIGH, so
 //     plugging in USB pulls it back out of sleep; that wake re-opens the awake
 //     window (kUsbWakeAwakeSec) and bounces the CDC link.
+//   * While awake the minute wait is interruptible, so unplug/replug repaints
+//     the "USB/BAT AWAKE/SLEEP" field within ~0.2 s instead of at the next tick.
 //   (esp_sleep_enable_usb_serial_jtag_wakeup() would be the direct signal but
 //   it is not in the pioarduino prebuilt libs — the charge-status GPIO is the
 //   available proxy for "USB just connected".)
@@ -178,6 +180,21 @@ static void renderStatus(const Rtc::DateTime& dt, bool haveTime, uint16_t pct, b
   target.text(Rect{battX, kTopMargin, kBattBoxW, target.lineHeight(battStyle.font)}, bat, battStyle);
 }
 
+// Wait up to `ms` while staying awake, but return early the moment the USB /
+// stay-awake state changes, so the header can be repainted on unplug/replug
+// instead of at the next minute tick. Polls at 200 ms (well under the e-ink
+// FAST refresh time); it only breaks on an actual state flip, so a stable link
+// costs no extra refreshes.
+static void waitWhileAwake(uint32_t ms) {
+  const bool usbEntry = (bool)Serial || battery.isCharging();
+  const uint32_t deadline = millis() + ms;
+  while (static_cast<int32_t>(deadline - millis()) > 0) {
+    if (((bool)Serial || battery.isCharging()) != usbEntry) return;  // plugged / unplugged
+    if (!(bool)Serial && !battery.isCharging() && !inStayAwakeWindow()) return;  // window lapsed → let loop() sleep
+    delay(200);
+  }
+}
+
 // ---- Arduino entry points ------------------------------------------
 
 void setup() {
@@ -235,7 +252,7 @@ void loop() {
   const bool stayAwake = serialUp || charging || inStayAwakeWindow();
 
   if (stayAwake) {
-    delay(toNext * 1000UL);
+    waitWhileAwake(toNext * 1000UL);
   } else {
     esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(toNext) * 1000000ULL);
     gpio_wakeup_enable(kChargeStatGpio, GPIO_INTR_HIGH_LEVEL);

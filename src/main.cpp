@@ -32,16 +32,29 @@
 //
 // Option D per the plan: no deep sleep, no rail cut — trades higher average
 // sleep current for a flicker-free clock. The point is to measure that current.
+//
+// Reader feature: pressing Power fetches plain text from kFetchUrl over WiFi
+// and shows it full-screen, word-wrapped and paginated; Left/Right (the two
+// physical nav keys) turn pages. Entering reader mode suspends the clock tick
+// and keeps the ESP32 awake (no light sleep) so button presses stay
+// responsive — see enterReaderModeAndFetch() / g_readerMode below. A Power
+// press while asleep on battery also wakes the board via a second GPIO
+// wakeup source (kPowerButtonGpio), mirroring the existing charger-wake path.
 
 #include <Arduino.h>
 #include <time.h>
+#include <string>
 
 #include <driver/gpio.h>
 #include <esp_sleep.h>
 
+#include <WiFi.h>
+
 #include <BoardConfig.h>
 #include <EInkDisplay.h>
 #include <FreeInkUIDisplayTarget.h>
+#include <InputManager.h>
+#include <SecureHttpClient.h>
 #include <XteinkDetect.h>
 #include <Rtc.h>
 #include <BatteryMonitor.h>
@@ -50,7 +63,10 @@ using freeink::ui::DisplayTarget;
 using freeink::ui::Orientation;
 using freeink::ui::Rect;
 using freeink::ui::TextAlign;
+using freeink::ui::TextAreaLine;
 using freeink::ui::TextStyle;
+using freeink::ui::textAreaVisibleLines;
+using freeink::ui::textAreaWalk;
 
 // ---- Config --------------------------------------------------------------
 static constexpr uint32_t kUpdatePeriodSec   = 60;   // redraw cadence
@@ -63,6 +79,27 @@ static constexpr int16_t  kStatBoxW        = 240;   // fits "USB AWAKE" at 24 px
 // X4 Pro charger /STAT (BoardConfig batteryChargeStatus), driven HIGH while
 // charging — used both to display "USB attached" and to wake from light sleep.
 static constexpr gpio_num_t kChargeStatGpio = GPIO_NUM_21;
+
+// ---- Reader feature config (fetch-on-button) ------------------------------
+// EDIT THESE before flashing: WiFi credentials and the URL to fetch as plain
+// text. There is no credential-storage helper in the SDK yet, so these are
+// plain source constants per request.
+static constexpr char kWifiSsid[]     = "YOUR_WIFI_SSID";
+static constexpr char kWifiPassword[] = "YOUR_WIFI_PASSWORD";
+// Plain http:// only (SecureNet's TLS stack is opt-in — see platformio.ini).
+static constexpr char kFetchUrl[]     = "http://example.com/article.txt";
+static constexpr uint32_t kWifiConnectTimeoutMs = 15000;
+static constexpr uint32_t kFetchTimeoutMs       = 15000;
+// Reader mode stays fully awake (no light sleep) to keep buttons responsive;
+// fall back to the clock screen after this long without a button press so a
+// forgotten reader session doesn't pin the board awake indefinitely.
+static constexpr uint32_t kReaderIdleTimeoutMs  = 5UL * 60UL * 1000UL;
+static constexpr int16_t  kReaderBodyGap        = 8;  // px between the page-indicator row and body text
+
+// Power button (BoardConfig XTEINK_X4_PRO input.power = GPIO3, active-LOW) —
+// also armed as a light-sleep wakeup source alongside kChargeStatGpio so a
+// press lands even while the board is asleep on battery.
+static constexpr gpio_num_t kPowerButtonGpio = static_cast<gpio_num_t>(InputManager::POWER_BUTTON_PIN);
 
 // ---- Persistent across light sleep (and a reset, via RTC memory) ---------
 RTC_DATA_ATTR uint16_t g_lastBattPct = 0xFFFF;      // 0xFFFF = no good read yet
@@ -77,6 +114,14 @@ static EInkDisplay display(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE
                            BoardConfig::ACTIVE.display.rst, BoardConfig::ACTIVE.display.busy);
 static Rtc rtc;
 static BatteryMonitor battery;
+static InputManager input;
+
+// ---- Reader state ---------------------------------------------------------
+static bool g_readerMode = false;             // true while showing fetched text instead of the clock
+static uint32_t g_readerLastActivityMs = 0;   // last button press in reader mode, for the idle timeout
+static std::string g_articleText;             // last-fetched body
+static uint32_t g_readerTopLine = 0;          // first visual line shown on the current page
+static uint32_t g_readerLineCount = 0;        // total word-wrapped visual lines in g_articleText
 
 // The elapsed-time display counts from here; setup() re-sets the RTC to this on
 // every boot, so "Nd HH:MM" is always "time since the last reset".
@@ -181,18 +226,168 @@ static void renderStatus(const Rtc::DateTime& dt, bool haveTime, uint16_t pct, b
 }
 
 // Wait up to `ms` while staying awake, but return early the moment the USB /
-// stay-awake state changes, so the header can be repainted on unplug/replug
-// instead of at the next minute tick. Polls at 200 ms (well under the e-ink
-// FAST refresh time); it only breaks on an actual state flip, so a stable link
-// costs no extra refreshes.
-static void waitWhileAwake(uint32_t ms) {
+// stay-awake state changes (so the header can be repainted on unplug/replug
+// instead of at the next minute tick) or the Power button is pressed (so the
+// reader can launch immediately). Polls at 50 ms — still well under the
+// e-ink FAST refresh time, tight enough for snappy button response.
+// Returns true iff it returned because of a Power-button press.
+static bool waitWhileAwake(uint32_t ms) {
   const bool usbEntry = (bool)Serial || battery.isCharging();
   const uint32_t deadline = millis() + ms;
   while (static_cast<int32_t>(deadline - millis()) > 0) {
-    if (((bool)Serial || battery.isCharging()) != usbEntry) return;  // plugged / unplugged
-    if (!(bool)Serial && !battery.isCharging() && !inStayAwakeWindow()) return;  // window lapsed → let loop() sleep
+    input.update();
+    if (input.wasPressed(InputManager::BTN_POWER)) return true;
+    if (((bool)Serial || battery.isCharging()) != usbEntry) return false;  // plugged / unplugged
+    if (!(bool)Serial && !battery.isCharging() && !inStayAwakeWindow()) return false;  // window lapsed → let loop() sleep
+    delay(50);
+  }
+  return false;
+}
+
+// ---- Reader (fetch-on-button) ---------------------------------------------
+
+// Body text area: a one-line page-indicator row up top, then the wrapped
+// article text filling the rest of the 480x800 portrait screen.
+static Rect readerBodyRect(const DisplayTarget& target, int16_t lineHeight) {
+  const int16_t y = static_cast<int16_t>(kTopMargin + lineHeight + kReaderBodyGap);
+  return Rect{kEdgeInset, y, static_cast<int16_t>(target.logicalWidth() - 2 * kEdgeInset),
+             static_cast<int16_t>(target.logicalHeight() - y - kEdgeInset)};
+}
+
+static bool connectWifiIfNeeded() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(kWifiSsid, kWifiPassword);
+  const uint32_t deadline = millis() + kWifiConnectTimeoutMs;
+  while (WiFi.status() != WL_CONNECTED && static_cast<int32_t>(deadline - millis()) > 0) {
     delay(200);
   }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// GET kFetchUrl and store the response body. Returns the HTTP status (or a
+// negative freeink::SecureHttpClient transport error).
+static int fetchArticleText(std::string& outBody) {
+  freeink::SecureHttpClient http;
+  http.setTimeout(kFetchTimeoutMs);
+  http.setUserAgent("FreeInk-X4Pro/1.0");
+  if (!http.begin(kFetchUrl)) return -1;
+  const int status = http.GET();
+  if (status == 200) outBody = http.getString();
+  return status;
+}
+
+// One centered full-screen line — used for the "Connecting..." / error states
+// that bracket a fetch.
+static void renderReaderMessage(const char* msg) {
+  DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
+                       display.getDisplayWidthBytes(), Orientation::Portrait);
+  display.clearScreen(0xFF);
+  TextStyle style;
+  style.align = TextAlign::Center;
+  const int16_t lh = target.lineHeight(style.font);
+  target.text(Rect{0, static_cast<int16_t>(target.logicalHeight() / 2 - lh / 2), target.logicalWidth(), lh}, msg,
+             style);
+  display.displayBuffer(EInkDisplay::FAST_REFRESH, /*turnOffScreen=*/true);
+}
+
+// Draws the page-indicator row + the visual lines of g_articleText starting at
+// g_readerTopLine.
+static void renderReaderPage() {
+  DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
+                       display.getDisplayWidthBytes(), Orientation::Portrait);
+  display.clearScreen(0xFF);
+
+  TextStyle bodyStyle;
+  bodyStyle.align = TextAlign::Left;
+  const int16_t lh = target.lineHeight(bodyStyle.font);
+  const Rect bodyRect = readerBodyRect(target, lh);
+  const uint16_t visible = textAreaVisibleLines(bodyRect, lh);
+
+  char header[32];
+  if (g_readerLineCount == 0 || visible == 0) {
+    snprintf(header, sizeof header, "(empty)");
+  } else {
+    const uint32_t lastPage = (g_readerLineCount - 1) / visible;
+    const uint32_t curPage = g_readerTopLine / visible;
+    snprintf(header, sizeof header, "PAGE %lu/%lu", static_cast<unsigned long>(curPage + 1),
+             static_cast<unsigned long>(lastPage + 1));
+  }
+  TextStyle headerStyle;
+  headerStyle.align = TextAlign::Center;
+  target.text(Rect{0, kTopMargin, target.logicalWidth(), lh}, header, headerStyle);
+
+  if (visible > 0) {
+    textAreaWalk(target, bodyRect.width, g_articleText.c_str(), bodyStyle,
+                [&](uint32_t idx, const TextAreaLine& ln) {
+                  if (idx < g_readerTopLine || idx >= g_readerTopLine + visible) return;
+                  char buf[224];
+                  const uint16_t n = ln.len < 220 ? ln.len : 220;
+                  memcpy(buf, g_articleText.c_str() + ln.start, n);
+                  buf[n] = '\0';
+                  const int16_t y = static_cast<int16_t>(bodyRect.y + (idx - g_readerTopLine) * lh);
+                  target.text(Rect{bodyRect.x, y, bodyRect.width, lh}, buf, bodyStyle);
+                });
+  }
+
+  display.displayBuffer(EInkDisplay::FAST_REFRESH, /*turnOffScreen=*/true);
+}
+
+// Left/Right page turn. direction<0 = previous page, >0 = next page. No-op
+// (redraws the same page) past either end.
+static void readerTurnPage(int direction) {
+  DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
+                       display.getDisplayWidthBytes(), Orientation::Portrait);
+  TextStyle bodyStyle;
+  const int16_t lh = target.lineHeight(bodyStyle.font);
+  const Rect bodyRect = readerBodyRect(target, lh);
+  const uint16_t visible = textAreaVisibleLines(bodyRect, lh);
+  if (visible == 0) return;
+
+  if (direction < 0) {
+    g_readerTopLine = g_readerTopLine >= visible ? g_readerTopLine - visible : 0;
+  } else if (direction > 0 && g_readerLineCount > visible) {
+    const uint32_t maxTop = ((g_readerLineCount - 1) / visible) * visible;
+    g_readerTopLine = g_readerTopLine + visible <= maxTop ? g_readerTopLine + visible : maxTop;
+  }
+  renderReaderPage();
+}
+
+// Power-button entry point: connect WiFi if needed, GET kFetchUrl, and show
+// page 1 (or an error screen). Leaves g_readerMode set so loop() switches to
+// polling Left/Right/Power instead of the clock tick.
+static void enterReaderModeAndFetch() {
+  g_readerMode = true;
+  g_readerLastActivityMs = millis();
+
+  renderReaderMessage("Connecting WiFi...");
+  if (!connectWifiIfNeeded()) {
+    renderReaderMessage("WiFi connect failed");
+    g_readerLineCount = 0;
+    g_readerTopLine = 0;
+    return;
+  }
+
+  renderReaderMessage("Fetching...");
+  const int status = fetchArticleText(g_articleText);
+  g_readerTopLine = 0;
+  g_readerLineCount = 0;
+  if (status != 200) {
+    char msg[32];
+    snprintf(msg, sizeof msg, "Fetch failed (HTTP %d)", status);
+    renderReaderMessage(msg);
+    return;
+  }
+
+  DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
+                       display.getDisplayWidthBytes(), Orientation::Portrait);
+  TextStyle bodyStyle;
+  const int16_t lh = target.lineHeight(bodyStyle.font);
+  const Rect bodyRect = readerBodyRect(target, lh);
+  textAreaWalk(target, bodyRect.width, g_articleText.c_str(), bodyStyle,
+              [&](uint32_t, const TextAreaLine&) { ++g_readerLineCount; });
+
+  renderReaderPage();
 }
 
 // ---- Arduino entry points ------------------------------------------
@@ -220,6 +415,7 @@ void setup() {
                 dt.day, dt.hour, dt.minute, dt.second);
 
   bringUpPanel();
+  input.begin();
 
   uint16_t pct = 0;
   const bool battOk = readBattery(pct);        // first read runs the one-time CW2017 BATINFO upload
@@ -235,6 +431,34 @@ void setup() {
 }
 
 void loop() {
+  input.update();
+
+  // Reader mode owns the buttons while active: Left/Right page, Power
+  // re-fetches, and the board stays fully awake (no light sleep) so presses
+  // stay responsive. An idle timeout drops back to the clock screen.
+  if (g_readerMode) {
+    if (input.wasPressed(InputManager::BTN_UP)) {         // Left = previous page
+      readerTurnPage(-1);
+      g_readerLastActivityMs = millis();
+    } else if (input.wasPressed(InputManager::BTN_DOWN)) {  // Right = next page
+      readerTurnPage(+1);
+      g_readerLastActivityMs = millis();
+    } else if (input.wasPressed(InputManager::BTN_POWER)) {  // re-fetch
+      enterReaderModeAndFetch();
+    } else if (millis() - g_readerLastActivityMs > kReaderIdleTimeoutMs) {
+      g_readerMode = false;  // fall through to the clock screen below
+    }
+    if (g_readerMode) {
+      delay(30);
+      return;
+    }
+  }
+
+  if (input.wasPressed(InputManager::BTN_POWER)) {
+    enterReaderModeAndFetch();
+    return;
+  }
+
   Rtc::DateTime dt{};
   bool rtcOk = rtc.now(dt);
 
@@ -252,20 +476,39 @@ void loop() {
   const bool stayAwake = serialUp || charging || inStayAwakeWindow();
 
   if (stayAwake) {
-    waitWhileAwake(toNext * 1000UL);
+    if (waitWhileAwake(toNext * 1000UL)) {
+      enterReaderModeAndFetch();
+      return;
+    }
   } else {
     esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(toNext) * 1000000ULL);
     gpio_wakeup_enable(kChargeStatGpio, GPIO_INTR_HIGH_LEVEL);
+    gpio_wakeup_enable(kPowerButtonGpio, GPIO_INTR_LOW_LEVEL);  // Power press, active-low
     esp_sleep_enable_gpio_wakeup();
     esp_light_sleep_start();  // RAM + panel controller retained; execution resumes here
 
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
-      // Charger /STAT went HIGH → USB (re)connected. Bounce the CDC link (setup()
-      // won't re-run to do it) and hold awake so a reflash can land.
+      // Charger /STAT went HIGH (USB reconnected) and/or the Power button is
+      // down — level-triggered wake doesn't tell us which, so check both.
+      // Bounce the CDC link (setup() won't re-run to do it) and hold awake so
+      // a reflash can land either way.
       Serial.end();
       delay(20);
       Serial.begin(115200);
       g_stayAwakeUntilMs = millis() + kUsbWakeAwakeSec * 1000UL;
+
+      if (digitalRead(kPowerButtonGpio) == LOW) {
+        // Confirm with a few debounced samples (level wake fires the instant
+        // the pin reads low; wasPressed() needs a settled edge to commit).
+        for (int i = 0; i < 5; ++i) {
+          input.update();
+          delay(10);
+        }
+        if (input.isPressed(InputManager::BTN_POWER)) {
+          enterReaderModeAndFetch();
+          return;
+        }
+      }
     }
   }
 

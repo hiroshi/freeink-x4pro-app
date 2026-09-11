@@ -212,15 +212,11 @@ static void bringUpPanel() {
   display.begin();
 }
 
-static void renderStatus(const Rtc::DateTime& dt, bool haveTime, uint16_t pct, bool battOk, uint16_t mv,
-                         bool awake, bool usb) {
-  // Portrait: 90 deg CW from panel-native, logical frame 480 wide x 800 tall,
-  // "top" = short edge. If the panel reads upside-down on hardware, switch to
-  // Orientation::PortraitInverted.
-  DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
-                       display.getDisplayWidthBytes(), Orientation::Portrait);
-  display.clearScreen(0xFF);  // white page (set bit = white)
-
+// The standard top-of-screen status row — link/power state (left), elapsed
+// clock (center), battery (right) — shared by the clock screen and every
+// reader screen so it reads as one consistent header throughout the app.
+static void drawStatusHeader(DisplayTarget& target, const Rtc::DateTime& dt, bool haveTime, uint16_t pct,
+                             bool battOk, uint16_t mv, bool awake, bool usb) {
   // Top-left: link + power state. "USB"/"BAT" = host attached or charger running
   // vs. on battery; "AWAKE"/"SLEEP" = whether the next gap light-sleeps (i.e.
   // whether a reflash can land right now).
@@ -253,6 +249,32 @@ static void renderStatus(const Rtc::DateTime& dt, bool haveTime, uint16_t pct, b
   target.text(Rect{battX, kTopMargin, kBattBoxW, target.lineHeight(battStyle.font)}, bat, battStyle);
 }
 
+static void renderStatus(const Rtc::DateTime& dt, bool haveTime, uint16_t pct, bool battOk, uint16_t mv,
+                         bool awake, bool usb) {
+  // Portrait: 90 deg CW from panel-native, logical frame 480 wide x 800 tall,
+  // "top" = short edge. If the panel reads upside-down on hardware, switch to
+  // Orientation::PortraitInverted.
+  DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
+                       display.getDisplayWidthBytes(), Orientation::Portrait);
+  display.clearScreen(0xFF);  // white page (set bit = white)
+  drawStatusHeader(target, dt, haveTime, pct, battOk, mv, awake, usb);
+}
+
+// Reads the same status quantities loop() gathers for the clock tick and
+// draws the standard header with them — the reader screens' equivalent of
+// renderStatus(), so they show the same USB/battery/clock header instead of
+// going without one.
+static void drawStatusHeaderNow(DisplayTarget& target) {
+  Rtc::DateTime dt{};
+  const bool rtcOk = rtc.now(dt);
+  uint16_t pct = 0;
+  const bool battOk = readBattery(pct);
+  const uint16_t mv = battery.readMillivolts();
+  const bool usbNow = (bool)Serial || battery.isCharging();
+  const bool awakeNow = usbNow || inStayAwakeWindow();
+  drawStatusHeader(target, dt, rtcOk, pct, battOk, mv, awakeNow, usbNow);
+}
+
 // Wait up to `ms` while staying awake, but return early the moment the USB /
 // stay-awake state changes (so the header can be repainted on unplug/replug
 // instead of at the next minute tick) or the Power button is pressed (so the
@@ -274,10 +296,18 @@ static bool waitWhileAwake(uint32_t ms) {
 
 // ---- Reader (fetch-on-button) ---------------------------------------------
 
-// Body text area: a one-line page-indicator row up top, then the wrapped
-// article text filling the rest of the 480x800 portrait screen.
+// y of the reader sub-header row (WiFi badge + page indicator): directly
+// below the standard status header (drawStatusHeaderNow, same row every
+// screen uses — USB/battery/clock), so the reader-specific info never
+// overlaps or replaces it.
+static int16_t readerSubHeaderRowY(int16_t lineHeight) {
+  return static_cast<int16_t>(kTopMargin + lineHeight);
+}
+
+// Body text area: the status header, the WiFi+page sub-header row below it,
+// then the wrapped article text filling the rest of the 480x800 portrait screen.
 static Rect readerBodyRect(const DisplayTarget& target, int16_t lineHeight) {
-  const int16_t y = static_cast<int16_t>(kTopMargin + lineHeight + kReaderBodyGap);
+  const int16_t y = static_cast<int16_t>(readerSubHeaderRowY(lineHeight) + lineHeight + kReaderBodyGap);
   return Rect{kEdgeInset, y, static_cast<int16_t>(target.logicalWidth() - 2 * kEdgeInset),
              static_cast<int16_t>(target.logicalHeight() - y - kEdgeInset)};
 }
@@ -302,15 +332,17 @@ static void wifiPowerOff() {
   g_wifiOn = false;
 }
 
-// Small top-left "WiFi ON/OFF" badge, drawn on every reader screen (mirrors
-// the clock screen's top-left status slot). Reflects g_wifiOn, not a live
-// WiFi.status() poll, since the point is to show the ON-only-while-fetching
-// intent rather than radio minutiae.
+// Small top-left "WiFi ON/OFF" badge, drawn on the reader sub-header row
+// (readerSubHeaderRowY) — one line below the standard status header, so it
+// never overlaps either that header or the centered "PAGE X/Y" indicator
+// sharing its row. Reflects g_wifiOn, not a live WiFi.status() poll, since
+// the point is to show the ON-only-while-fetching intent rather than radio
+// minutiae.
 static void drawWifiBadge(DisplayTarget& target) {
   TextStyle style;
   style.align = TextAlign::Left;
-  target.text(Rect{kEdgeInset, kTopMargin, kStatBoxW, target.lineHeight(style.font)},
-             g_wifiOn ? "WiFi ON" : "WiFi OFF", style);
+  const int16_t lh = target.lineHeight(style.font);
+  target.text(Rect{kEdgeInset, readerSubHeaderRowY(lh), kStatBoxW, lh}, g_wifiOn ? "WiFi ON" : "WiFi OFF", style);
 }
 
 // GET kFetchUrl and store the response body. Returns the HTTP status (or a
@@ -334,6 +366,7 @@ static void renderReaderMessage(const char* msg) {
   DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
                        display.getDisplayWidthBytes(), Orientation::Portrait);
   display.clearScreen(0xFF);
+  drawStatusHeaderNow(target);
   drawWifiBadge(target);
   TextStyle style;
   style.align = TextAlign::Center;
@@ -349,6 +382,7 @@ static void renderReaderPage() {
   DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
                        display.getDisplayWidthBytes(), Orientation::Portrait);
   display.clearScreen(0xFF);
+  drawStatusHeaderNow(target);
   drawWifiBadge(target);
 
   TextStyle bodyStyle;
@@ -357,18 +391,18 @@ static void renderReaderPage() {
   const Rect bodyRect = readerBodyRect(target, lh);
   const uint16_t visible = textAreaVisibleLines(bodyRect, lh);
 
-  char header[32];
+  char pageIndicator[32];
   if (g_readerLineCount == 0 || visible == 0) {
-    snprintf(header, sizeof header, "(empty)");
+    snprintf(pageIndicator, sizeof pageIndicator, "(empty)");
   } else {
     const uint32_t lastPage = (g_readerLineCount - 1) / visible;
     const uint32_t curPage = g_readerTopLine / visible;
-    snprintf(header, sizeof header, "PAGE %lu/%lu", static_cast<unsigned long>(curPage + 1),
+    snprintf(pageIndicator, sizeof pageIndicator, "PAGE %lu/%lu", static_cast<unsigned long>(curPage + 1),
              static_cast<unsigned long>(lastPage + 1));
   }
-  TextStyle headerStyle;
-  headerStyle.align = TextAlign::Center;
-  target.text(Rect{0, kTopMargin, target.logicalWidth(), lh}, header, headerStyle);
+  TextStyle pageStyle;
+  pageStyle.align = TextAlign::Center;
+  target.text(Rect{0, readerSubHeaderRowY(lh), target.logicalWidth(), lh}, pageIndicator, pageStyle);
 
   if (visible > 0) {
     textAreaWalk(target, bodyRect.width, g_articleText.c_str(), bodyStyle,

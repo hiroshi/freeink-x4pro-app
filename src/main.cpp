@@ -81,13 +81,24 @@ static constexpr int16_t  kStatBoxW        = 240;   // fits "USB AWAKE" at 24 px
 static constexpr gpio_num_t kChargeStatGpio = GPIO_NUM_21;
 
 // ---- Reader feature config (fetch-on-button) ------------------------------
-// EDIT THESE before flashing: WiFi credentials and the URL to fetch as plain
-// text. There is no credential-storage helper in the SDK yet, so these are
-// plain source constants per request.
-static constexpr char kWifiSsid[]     = "YOUR_WIFI_SSID";
-static constexpr char kWifiPassword[] = "YOUR_WIFI_PASSWORD";
+// WiFi credentials and the fetch URL come from build-time -D defines (see
+// platformio.ini's build_flags, fed from either real shell env vars or a
+// gitignored .env file — see .env.example) rather than source, since this repo
+// is public. Empty when unset; enterReaderModeAndFetch() refuses to run and
+// shows a "not configured" screen instead of connecting with an empty SSID.
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD ""
+#endif
+#ifndef FETCH_URL
+#define FETCH_URL ""
+#endif
+static constexpr char kWifiSsid[]     = WIFI_SSID;
+static constexpr char kWifiPassword[] = WIFI_PASSWORD;
 // Plain http:// only (SecureNet's TLS stack is opt-in — see platformio.ini).
-static constexpr char kFetchUrl[]     = "http://example.com/article.txt";
+static constexpr char kFetchUrl[]     = FETCH_URL;
 static constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 static constexpr uint32_t kFetchTimeoutMs       = 15000;
 // Reader mode stays fully awake (no light sleep) to keep buttons responsive;
@@ -359,6 +370,14 @@ static void readerTurnPage(int direction) {
 static void enterReaderModeAndFetch() {
   g_readerMode = true;
   g_readerLastActivityMs = millis();
+
+  if (kWifiSsid[0] == '\0' || kFetchUrl[0] == '\0') {
+    Serial.println("reader: not configured — set WIFI_SSID/WIFI_PASSWORD/FETCH_URL (see .env.example)");
+    renderReaderMessage("Not configured (see .env.example)");
+    g_readerLineCount = 0;
+    g_readerTopLine = 0;
+    return;
+  }
 
   renderReaderMessage("Connecting WiFi...");
   if (!connectWifiIfNeeded()) {

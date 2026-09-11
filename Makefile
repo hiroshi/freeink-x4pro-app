@@ -1,6 +1,12 @@
 PIO := /Library/Frameworks/Python.framework/Versions/Current/bin/pio
 FREEINK_SDK_URL := https://github.com/Free-Ink/freeink-sdk
 
+# Reader feature secrets (WiFi + fetch URL) — see .env.example. Silently
+# skipped if .env doesn't exist; real shell env vars still work either way,
+# since platformio.ini reads whatever's in the environment at build time.
+-include .env
+export WIFI_SSID WIFI_PASSWORD FETCH_URL
+
 .PHONY: build upload monitor
 
 build: $(PIO) freeink-sdk

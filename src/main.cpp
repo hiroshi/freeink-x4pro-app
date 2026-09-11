@@ -441,17 +441,27 @@ static void readerTurnPage(int direction) {
 }
 
 // Power-button entry point: connect WiFi if needed, GET kFetchUrl, and show
-// page 1 (or an error screen). Leaves g_readerMode set so loop() switches to
-// polling Left/Right/Power instead of the clock tick.
+// page 1. Leaves g_readerMode set so loop() switches to polling
+// Left/Right/Power instead of the clock tick.
+//
+// A failure (not configured / WiFi / HTTP) falls back to whatever article is
+// already loaded — g_readerLineCount/g_articleText are left untouched by every
+// failure path below (fetchArticleText only writes g_articleText on a 200) —
+// and just re-renders that page instead of clobbering it with an error
+// screen. An accidental Power press while reading shouldn't blank the page.
+// Only a genuinely fresh attempt (nothing loaded yet) shows the error text.
 static void enterReaderModeAndFetch() {
   g_readerMode = true;
   g_readerLastActivityMs = millis();
+  const bool hadArticle = g_readerLineCount > 0;
 
   if (kWifiSsid[0] == '\0' || kFetchUrl[0] == '\0') {
     Serial.println("reader: not configured — set WIFI_SSID/WIFI_PASSWORD/FETCH_URL (see .env.example)");
-    renderReaderMessage("Not configured (see .env.example)");
-    g_readerLineCount = 0;
-    g_readerTopLine = 0;
+    if (hadArticle) {
+      renderReaderPage();
+    } else {
+      renderReaderMessage("Not configured (see .env.example)");
+    }
     return;
   }
 
@@ -461,24 +471,33 @@ static void enterReaderModeAndFetch() {
   renderReaderMessage("Connecting WiFi...");
   if (!connectWifiIfNeeded()) {
     wifiPowerOff();
-    renderReaderMessage("WiFi connect failed");
-    g_readerLineCount = 0;
-    g_readerTopLine = 0;
+    Serial.println("reader: WiFi connect failed");
+    if (hadArticle) {
+      renderReaderPage();
+    } else {
+      renderReaderMessage("WiFi connect failed");
+    }
     return;
   }
 
   renderReaderMessage("Fetching...");
   const int status = fetchArticleText(g_articleText);
   wifiPowerOff();
-  g_readerTopLine = 0;
-  g_readerLineCount = 0;
   if (status != 200) {
-    char msg[32];
-    snprintf(msg, sizeof msg, "Fetch failed (HTTP %d)", status);
-    renderReaderMessage(msg);
+    Serial.printf("reader: fetch failed (HTTP %d)\n", status);
+    if (hadArticle) {
+      renderReaderPage();
+    } else {
+      char msg[32];
+      snprintf(msg, sizeof msg, "Fetch failed (HTTP %d)", status);
+      renderReaderMessage(msg);
+    }
     return;
   }
 
+  // Success: recompute pagination for the new article and show page 1.
+  g_readerTopLine = 0;
+  g_readerLineCount = 0;
   DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
                        display.getDisplayWidthBytes(), Orientation::Portrait);
   TextStyle bodyStyle;
@@ -486,6 +505,9 @@ static void enterReaderModeAndFetch() {
   const Rect bodyRect = readerBodyRect(target, lh);
   textAreaWalk(target, bodyRect.width, g_articleText.c_str(), bodyStyle,
               [&](uint32_t, const TextAreaLine&) { ++g_readerLineCount; });
+  Serial.printf("reader: fetched %u bytes -> %lu wrapped lines (bodyRect %d,%d %dx%d, lineHeight=%d)\n",
+                (unsigned)g_articleText.size(), (unsigned long)g_readerLineCount, bodyRect.x, bodyRect.y,
+                bodyRect.width, bodyRect.height, lh);
 
   renderReaderPage();
 }

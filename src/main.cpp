@@ -35,11 +35,17 @@
 //
 // Reader feature: pressing Power fetches plain text from kFetchUrl over WiFi
 // and shows it full-screen, word-wrapped and paginated; Left/Right (the two
-// physical nav keys) turn pages. Entering reader mode suspends the clock tick
-// and keeps the ESP32 awake (no light sleep) so button presses stay
-// responsive — see enterReaderModeAndFetch() / g_readerMode below. A Power
-// press while asleep on battery also wakes the board via a second GPIO
-// wakeup source (kPowerButtonGpio), mirroring the existing charger-wake path.
+// physical nav keys) turn pages. Entering reader mode suspends the plain clock
+// screen — it never comes back on its own, since the e-ink page holds at zero
+// power regardless of what the ESP32 is doing — but the SAME status header
+// (USB/battery/clock, drawStatusHeaderNow()) keeps showing at the top, and
+// once idle a little while the board light-sleeps between input polls just
+// like the clock screen does: waking on any nav/power button, a charger
+// connect (kLeftButtonGpio/kRightButtonGpio/kPowerButtonGpio/kChargeStatGpio),
+// or once a minute on a timer purely to refresh that header in place (page
+// position untouched) so it doesn't read stale forever between button presses.
+// See
+// enterReaderModeAndFetch() / dispatchReaderInput() / g_readerMode below.
 
 #include <Arduino.h>
 #include <time.h>
@@ -113,16 +119,27 @@ static constexpr char kWifiPassword[] = WIFI_PASSWORD;
 static constexpr char kFetchUrl[]     = FETCH_URL;
 static constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 static constexpr uint32_t kFetchTimeoutMs       = 15000;
-// Reader mode stays fully awake (no light sleep) to keep buttons responsive;
-// fall back to the clock screen after this long without a button press so a
-// forgotten reader session doesn't pin the board awake indefinitely.
-static constexpr uint32_t kReaderIdleTimeoutMs  = 5UL * 60UL * 1000UL;
+// Reader mode never falls back to the clock screen on its own — e-ink holds
+// whatever was last drawn at zero power, so there is nothing to gain (and a
+// mid-read page turning into the clock header is exactly the bug this avoids)
+// from redrawing over it just because the reader has been idle a while.
+// Instead, after this short a grace period since the last button press (with
+// no USB/charger attached) loop() light-sleeps BETWEEN polls, armed to wake on
+// any nav/power button or a charger connect — see the g_readerMode branch.
+// Kept short so a rapid run of page turns stays on the cheap busy-poll path
+// instead of paying a sleep/wake round trip between each one.
+static constexpr uint32_t kReaderSleepGraceMs   = 3000;
 static constexpr int16_t  kReaderBodyGap        = 8;  // px between the page-indicator row and body text
 
 // Power button (BoardConfig XTEINK_X4_PRO input.power = GPIO3, active-LOW) —
 // also armed as a light-sleep wakeup source alongside kChargeStatGpio so a
 // press lands even while the board is asleep on battery.
 static constexpr gpio_num_t kPowerButtonGpio = static_cast<gpio_num_t>(InputManager::POWER_BUTTON_PIN);
+// Left/Right nav keys (BoardConfig XTEINK_X4_PRO input.up=GPIO0/input.down=GPIO7,
+// active-LOW) — armed as light-sleep wakeup sources too so paging still works
+// after reader mode's own idle light sleep kicks in (kReaderSleepGraceMs).
+static constexpr gpio_num_t kLeftButtonGpio  = GPIO_NUM_0;
+static constexpr gpio_num_t kRightButtonGpio = GPIO_NUM_7;
 
 // ---- Persistent across light sleep (and a reset, via RTC memory) ---------
 RTC_DATA_ATTR uint16_t g_lastBattPct = 0xFFFF;      // 0xFFFF = no good read yet
@@ -512,6 +529,28 @@ static void enterReaderModeAndFetch() {
   renderReaderPage();
 }
 
+// Acts on a button-press edge already latched by the most recent input.update()
+// — Left/Right page, Power re-fetch. Shared by the normal per-tick poll in
+// loop() and the wake-from-idle-sleep path below, so a press caught by either
+// is handled identically. Returns whether it found (and handled) one.
+static bool dispatchReaderInput() {
+  if (input.wasPressed(InputManager::BTN_UP)) {  // Left = previous page
+    readerTurnPage(-1);
+    g_readerLastActivityMs = millis();
+    return true;
+  }
+  if (input.wasPressed(InputManager::BTN_DOWN)) {  // Right = next page
+    readerTurnPage(+1);
+    g_readerLastActivityMs = millis();
+    return true;
+  }
+  if (input.wasPressed(InputManager::BTN_POWER)) {  // re-fetch
+    enterReaderModeAndFetch();
+    return true;
+  }
+  return false;
+}
+
 // ---- Arduino entry points ------------------------------------------
 
 void setup() {
@@ -556,24 +595,57 @@ void loop() {
   input.update();
 
   // Reader mode owns the buttons while active: Left/Right page, Power
-  // re-fetches, and the board stays fully awake (no light sleep) so presses
-  // stay responsive. An idle timeout drops back to the clock screen.
+  // re-fetches. It never falls back to the clock screen on its own — the
+  // e-ink page stays on screen at zero power regardless of what the ESP32 is
+  // doing, so there is nothing to gain from redrawing over it. Once idle a
+  // little while (and not on USB/charging) it light-sleeps between polls
+  // instead of busy-waiting, waking on any nav/power button or a charger
+  // connect, so battery is still conserved without ever touching the display.
   if (g_readerMode) {
-    if (input.wasPressed(InputManager::BTN_UP)) {         // Left = previous page
-      readerTurnPage(-1);
-      g_readerLastActivityMs = millis();
-    } else if (input.wasPressed(InputManager::BTN_DOWN)) {  // Right = next page
-      readerTurnPage(+1);
-      g_readerLastActivityMs = millis();
-    } else if (input.wasPressed(InputManager::BTN_POWER)) {  // re-fetch
-      enterReaderModeAndFetch();
-    } else if (millis() - g_readerLastActivityMs > kReaderIdleTimeoutMs) {
-      g_readerMode = false;  // fall through to the clock screen below
+    if (!dispatchReaderInput()) {
+      const bool serialUp = (bool)Serial;
+      const bool charging = battery.isCharging();
+      if (!serialUp && !charging && !inStayAwakeWindow() &&
+          millis() - g_readerLastActivityMs > kReaderSleepGraceMs) {
+        // Also wake on a timer so the header (clock/battery/AWAKE-SLEEP) keeps
+        // ticking once a minute like the plain clock screen does, even with no
+        // button press — otherwise it reads whatever it was at the last page
+        // turn forever. Page position is untouched; only the header changes.
+        esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(kUpdatePeriodSec) * 1000000ULL);
+        gpio_wakeup_enable(kLeftButtonGpio, GPIO_INTR_LOW_LEVEL);
+        gpio_wakeup_enable(kRightButtonGpio, GPIO_INTR_LOW_LEVEL);
+        gpio_wakeup_enable(kPowerButtonGpio, GPIO_INTR_LOW_LEVEL);
+        gpio_wakeup_enable(kChargeStatGpio, GPIO_INTR_HIGH_LEVEL);
+        esp_sleep_enable_gpio_wakeup();
+        esp_light_sleep_start();  // RAM + panel controller retained; execution resumes here
+
+        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+          // Light sleep always drops the USB-Serial/JTAG link; bounce it so a
+          // charger/USB (re)connect or a fresh `pio run -t upload` both work.
+          Serial.end();
+          delay(20);
+          Serial.begin(115200);
+          g_stayAwakeUntilMs = millis() + kUsbWakeAwakeSec * 1000UL;
+          // Confirm with a few debounced samples (level wake fires the
+          // instant a pin reads its wake level; wasPressed() needs a settled
+          // edge to commit) and act on it now rather than waiting for next
+          // loop()'s update() to (maybe) miss the edge.
+          for (int i = 0; i < 5; ++i) {
+            input.update();
+            delay(10);
+          }
+          dispatchReaderInput();
+        } else {
+          // Timer wake, no button involved: just refresh the header in place
+          // (FAST_REFRESH only touches pixels that actually changed, so this
+          // costs nothing extra for the unchanged body text below it).
+          renderReaderPage();
+        }
+      } else {
+        delay(30);
+      }
     }
-    if (g_readerMode) {
-      delay(30);
-      return;
-    }
+    return;
   }
 
   if (input.wasPressed(InputManager::BTN_POWER)) {

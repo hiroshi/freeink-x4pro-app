@@ -59,6 +59,17 @@
 #include <Rtc.h>
 #include <BatteryMonitor.h>
 
+#if defined(FREEINK_NET_WOLFSSL)
+// Pulls in the Arduino-wolfSSL port's own wolfssl/wolfcrypt/settings.h +
+// wolfssl/ssl.h, plus (non-inline, so include this exactly once across the
+// project) its definition of wolfSSL_Arduino_Serial_Print — the debug-log
+// sink wolfSSL's logging.c links against by symbol name whenever DEBUG_WOLFSSL
+// ends up enabled. SecureClient.cpp includes <wolfssl/ssl.h> directly (not
+// this wrapper), so without this include here the symbol is never emitted and
+// the link fails.
+#include <wolfssl.h>
+#endif
+
 using freeink::ui::DisplayTarget;
 using freeink::ui::Orientation;
 using freeink::ui::Rect;
@@ -97,7 +108,8 @@ static constexpr gpio_num_t kChargeStatGpio = GPIO_NUM_21;
 #endif
 static constexpr char kWifiSsid[]     = WIFI_SSID;
 static constexpr char kWifiPassword[] = WIFI_PASSWORD;
-// Plain http:// only (SecureNet's TLS stack is opt-in — see platformio.ini).
+// http:// or https:// — TLS 1.3 via wolfSSL is on (see platformio.ini);
+// fetchArticleText() below skips certificate verification (setInsecure()).
 static constexpr char kFetchUrl[]     = FETCH_URL;
 static constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 static constexpr uint32_t kFetchTimeoutMs       = 15000;
@@ -133,6 +145,11 @@ static uint32_t g_readerLastActivityMs = 0;   // last button press in reader mod
 static std::string g_articleText;             // last-fetched body
 static uint32_t g_readerTopLine = 0;          // first visual line shown on the current page
 static uint32_t g_readerLineCount = 0;        // total word-wrapped visual lines in g_articleText
+// Radio only comes up for the connect+fetch attempt itself: true from just
+// before WiFi.begin() until the fetch finishes (success or failure), then
+// wifiPowerOff() clears it before light sleep is allowed again. Drives the
+// "WiFi ON/OFF" header badge on every reader screen.
+static bool g_wifiOn = false;
 
 // The elapsed-time display counts from here; setup() re-sets the RTC to this on
 // every boot, so "Nd HH:MM" is always "time since the last reset".
@@ -276,12 +293,35 @@ static bool connectWifiIfNeeded() {
   return WiFi.status() == WL_CONNECTED;
 }
 
+// Fully powers the radio down (not just disconnects the association) so the
+// board draws idle current again before it's allowed back into light sleep.
+// Called right after the fetch attempt finishes, success or failure.
+static void wifiPowerOff() {
+  WiFi.disconnect(/*wifioff=*/true);
+  WiFi.mode(WIFI_OFF);
+  g_wifiOn = false;
+}
+
+// Small top-left "WiFi ON/OFF" badge, drawn on every reader screen (mirrors
+// the clock screen's top-left status slot). Reflects g_wifiOn, not a live
+// WiFi.status() poll, since the point is to show the ON-only-while-fetching
+// intent rather than radio minutiae.
+static void drawWifiBadge(DisplayTarget& target) {
+  TextStyle style;
+  style.align = TextAlign::Left;
+  target.text(Rect{kEdgeInset, kTopMargin, kStatBoxW, target.lineHeight(style.font)},
+             g_wifiOn ? "WiFi ON" : "WiFi OFF", style);
+}
+
 // GET kFetchUrl and store the response body. Returns the HTTP status (or a
 // negative freeink::SecureHttpClient transport error).
 static int fetchArticleText(std::string& outBody) {
   freeink::SecureHttpClient http;
   http.setTimeout(kFetchTimeoutMs);
   http.setUserAgent("FreeInk-X4Pro/1.0");
+  // No CA bundle is wired up on-device (see SecureHttpClient.h), so https://
+  // connects but doesn't verify the server's certificate.
+  http.setInsecure();
   if (!http.begin(kFetchUrl)) return -1;
   const int status = http.GET();
   if (status == 200) outBody = http.getString();
@@ -294,6 +334,7 @@ static void renderReaderMessage(const char* msg) {
   DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
                        display.getDisplayWidthBytes(), Orientation::Portrait);
   display.clearScreen(0xFF);
+  drawWifiBadge(target);
   TextStyle style;
   style.align = TextAlign::Center;
   const int16_t lh = target.lineHeight(style.font);
@@ -308,6 +349,7 @@ static void renderReaderPage() {
   DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(), display.getDisplayHeight(),
                        display.getDisplayWidthBytes(), Orientation::Portrait);
   display.clearScreen(0xFF);
+  drawWifiBadge(target);
 
   TextStyle bodyStyle;
   bodyStyle.align = TextAlign::Left;
@@ -379,8 +421,12 @@ static void enterReaderModeAndFetch() {
     return;
   }
 
+  // WiFi comes on only for this connect+fetch attempt; wifiPowerOff() below
+  // always runs before the next render, whichever way this ends.
+  g_wifiOn = true;
   renderReaderMessage("Connecting WiFi...");
   if (!connectWifiIfNeeded()) {
+    wifiPowerOff();
     renderReaderMessage("WiFi connect failed");
     g_readerLineCount = 0;
     g_readerTopLine = 0;
@@ -389,6 +435,7 @@ static void enterReaderModeAndFetch() {
 
   renderReaderMessage("Fetching...");
   const int status = fetchArticleText(g_articleText);
+  wifiPowerOff();
   g_readerTopLine = 0;
   g_readerLineCount = 0;
   if (status != 200) {
